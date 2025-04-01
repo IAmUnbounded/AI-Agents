@@ -4,7 +4,7 @@ Multi-Agent System for Code Writing
 This system consists of 5 agents:
 1. Orchestrator Agent - Coordinates the workflow and manages communication
 2. Planning Agent - Creates high-level plans and architecture
-3. Coding Agent - Implements the actual code
+3. Coding Agent - Implements the actual code (now with language-specific agents)
 4. Checking Agent - Reviews code for bugs and improvements
 5. Testing Agent - Runs the code and identifies errors
 
@@ -35,6 +35,38 @@ from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
 
+# Import the language-specific agents module
+from language_specific_agents import (
+    decide_language,
+    language_specific_coding,
+    get_language_coding_agent,
+    get_file_extension,
+    save_multiple_files
+)
+
+from langchain_core.messages import (
+    AIMessage, 
+    HumanMessage, 
+    SystemMessage,
+    FunctionMessage,
+    ChatMessage
+)
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.tools import tool
+
+from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolNode
+from langgraph.checkpoint.memory import MemorySaver
+
+# Import the language-specific agents module
+from language_specific_agents import (
+    decide_language,
+    language_specific_coding,
+    get_language_coding_agent,
+    get_file_extension,
+    save_multiple_files
+)
+
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
@@ -59,7 +91,7 @@ def update_progress(stage, message):
 update_progress("SETUP", "Initializing LLM with Gemini 2.0 Flash model")
 
 # Configure the Gemini API
-os.environ["GOOGLE_API_KEY"] = "your_api_key"
+os.environ["GOOGLE_API_KEY"] = "your_api_key"  # Replace with your actual API key
 genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
 
 try:
@@ -185,6 +217,67 @@ def extract_code_from_response(content: str) -> str:
         # As a last resort, use the entire content
         return content
 
+# Import string module for filename sanitization
+import string
+
+# Function to sanitize filenames
+def sanitize_filename(filename):
+    """
+    Sanitize a filename by removing invalid characters.
+    
+    Args:
+        filename: The filename to sanitize
+        
+    Returns:
+        A sanitized filename that is safe to use
+    """
+    # Remove invalid characters
+    valid_chars = "-_.() %s%s" % (string.ascii_letters, string.digits)
+    sanitized = ''.join(c for c in filename if c in valid_chars)
+    # Remove any comment markers or other problematic patterns
+    sanitized = sanitized.replace('/*', '').replace('*/', '')
+    sanitized = sanitized.strip()
+    # If filename becomes empty after sanitization, use a default
+    if not sanitized:
+        return "unnamed_file.txt"
+    return sanitized
+
+# Function to ensure a file can be written (handles permissions and existence)
+def ensure_file_writable(filepath):
+    """
+    Ensure a file can be written to by checking and modifying permissions if needed.
+    
+    Args:
+        filepath: Path to the file to check
+        
+    Returns:
+        True if the file can be written, False otherwise
+    """
+    # Check if file exists
+    if os.path.exists(filepath):
+        # Try to make it writable if it exists
+        try:
+            os.chmod(filepath, 0o666)  # Make file writable
+            # On Windows, we may need to handle read-only attribute
+            if os.name == 'nt':  # Windows
+                import stat
+                if not os.access(filepath, os.W_OK):
+                    current_mode = os.stat(filepath).st_mode
+                    os.chmod(filepath, current_mode | stat.S_IWRITE)
+            return True
+        except Exception as e:
+            logger.error(f"Could not modify permissions for {filepath}: {str(e)}")
+            return False
+    # If file doesn't exist, check if directory is writable
+    directory = os.path.dirname(filepath)
+    if directory and not os.path.exists(directory):
+        try:
+            os.makedirs(directory)
+        except Exception as e:
+            logger.error(f"Error creating directory {directory}: {str(e)}")
+            return False
+    return True
+
 # Define the state for our graph
 class AgentState(TypedDict):
     messages: List[Union[AIMessage, HumanMessage, SystemMessage, FunctionMessage]]
@@ -193,6 +286,7 @@ class AgentState(TypedDict):
     code: str
     review: str
     test_results: str
+    language: str  # Added language field to track which language was selected
     iteration_count: int  # Add iteration counter to prevent infinite loops
     next: Literal["planning", "coding", "checking", "testing", "orchestrator", "end"]
 
@@ -291,6 +385,7 @@ def orchestrator(state: AgentState) -> AgentState:
     code = state.get("code", "")
     review = state.get("review", "")
     test_results = state.get("test_results", "")
+    language = state.get("language", "")
     
     # Get the current iteration count or initialize to 0
     iteration_count = state.get("iteration_count", 0) + 1
@@ -303,6 +398,7 @@ def orchestrator(state: AgentState) -> AgentState:
         return {"messages": messages, "task": task, 
                 "plan": plan, "code": code, 
                 "review": review, "test_results": test_results,
+                "language": language,
                 "iteration_count": iteration_count,
                 "next": "end"}
     
@@ -312,12 +408,19 @@ def orchestrator(state: AgentState) -> AgentState:
         if not messages:
             messages = [HumanMessage(content="Please help with this task.")]
         
+        # Determine language if not already set and we have a task
+        if not language and task and not plan:
+            # Try to determine language early
+            language = decide_language(messages)
+            logger.info(f"ORCHESTRATOR: Early language detection: {language}")
+        
         # Add a specific instruction for the orchestrator to help it make better decisions
         orchestrator_instruction = HumanMessage(
             content=f"""Current state:
 - Task: {task}
 - Plan: {"Completed" if plan else "Not started"}
 - Code: {"Completed" if code else "Not started"}
+- Language: {language if language else "Not determined yet"}
 - Review: {"Completed" if review else "Not started"}
 - Test Results: {"Completed" if test_results else "Not started"}
 - Iteration: {iteration_count}/{MAX_ITERATIONS}
@@ -408,6 +511,7 @@ Your decision should be one of: "planning", "coding", "checking", "testing", or 
         return {"messages": messages, "task": task, 
                 "plan": plan, "code": code, 
                 "review": review, "test_results": test_results, 
+                "language": language,
                 "iteration_count": iteration_count,
                 "next": next_agent}
     except GoogleAPIError as api_err:
@@ -417,6 +521,7 @@ Your decision should be one of: "planning", "coding", "checking", "testing", or 
         return {"messages": messages, "task": task, 
                 "plan": plan, "code": code, 
                 "review": review, "test_results": test_results, 
+                "language": language,
                 "iteration_count": iteration_count,
                 "next": "end"}
     except Exception as e:
@@ -426,6 +531,7 @@ Your decision should be one of: "planning", "coding", "checking", "testing", or 
         return {"messages": messages, "task": task, 
                 "plan": plan, "code": code, 
                 "review": review, "test_results": test_results, 
+                "language": language,
                 "iteration_count": iteration_count,
                 "next": "end"}
 
@@ -435,10 +541,13 @@ def planning(state: AgentState) -> AgentState:
     start_time = time.time()
     
     messages = state["messages"]
+    language = state.get("language", "")
     
     try:
         # Add a specific instruction for the planning agent
-        planning_instruction = HumanMessage(content=f"Based on the task description, create a detailed plan for implementing the code.")
+        planning_instruction = HumanMessage(
+            content=f"Based on the task description, create a detailed plan for implementing the code{' in ' + language if language else ''}."
+        )
         planning_messages = messages + [planning_instruction]
         
         logger.info("PLANNING: Invoking planning LLM")
@@ -453,12 +562,18 @@ def planning(state: AgentState) -> AgentState:
         logger.info("PLANNING: Plan created")
         logger.info(f"PLANNING: Plan length: {len(plan)} characters")
         
+        # If language is not set yet, try to determine it from the plan
+        if not language:
+            language = decide_language(messages)
+            logger.info(f"PLANNING: Detected language from plan: {language}")
+        
         elapsed = time.time() - start_time
         logger.info(f"PLANNING: Completed in {elapsed:.2f} seconds")
         
         return {"messages": messages, "task": state.get("task", ""), 
                 "plan": plan, "code": state.get("code", ""), 
                 "review": state.get("review", ""), "test_results": state.get("test_results", ""),
+                "language": language,
                 "iteration_count": state.get("iteration_count", 0),
                 "next": "orchestrator"}
     except GoogleAPIError as api_err:
@@ -468,6 +583,7 @@ def planning(state: AgentState) -> AgentState:
         return {"messages": messages, "task": state.get("task", ""), 
                 "plan": state.get("plan", ""), "code": state.get("code", ""), 
                 "review": state.get("review", ""), "test_results": state.get("test_results", ""),
+                "language": language,
                 "iteration_count": state.get("iteration_count", 0),
                 "next": "orchestrator"}
     except Exception as e:
@@ -477,6 +593,7 @@ def planning(state: AgentState) -> AgentState:
         return {"messages": messages, "task": state.get("task", ""), 
                 "plan": state.get("plan", ""), "code": state.get("code", ""), 
                 "review": state.get("review", ""), "test_results": state.get("test_results", ""),
+                "language": language,
                 "iteration_count": state.get("iteration_count", 0),
                 "next": "orchestrator"}
 
@@ -487,97 +604,44 @@ def coding(state: AgentState) -> AgentState:
     
     messages = state["messages"]
     plan = state["plan"]
+    task = state.get("task", "")
     
     try:
-        # Add a specific instruction for the coding agent with clearer instructions
+        # First, determine which language to use if not already decided
+        language = state.get("language", "")
+        if not language:
+            language = decide_language(messages)
+            logger.info(f"CODING: Selected language: {language}")
+        else:
+            logger.info(f"CODING: Using previously selected language: {language}")
+        
+        # Add a message to inform about language selection
+        language_info_message = SystemMessage(
+            content=f"The system has selected {language} as the most appropriate language for this task."
+        )
+        messages.append(language_info_message)
+        
+        # Use the language-specific coding function
+        code, language = language_specific_coding(state, messages, plan)
+        
+        # Get the language-specific agent response to add to messages
         coding_instruction = HumanMessage(
             content=f"""Based on this plan:
 
 {plan}
 
-Please implement the complete code. Make sure to:
-1. Include all necessary imports
-2. Implement all functions and classes mentioned in the plan
-3. Add appropriate comments and documentation
-4. If the implementation requires multiple files, clearly indicate each file with a filename header
+And this task:
 
-For multiple files, use this format:
-```
-// FILENAME: example.js
-// Code for example.js goes here
-```
+{task}
 
-```
-/* FILENAME: styles.css */
-/* Code for styles.css goes here */
-```
-
-```python
-# FILENAME: app.py
-# Code for app.py goes here
-```
-
-Make sure each file is properly formatted and includes all necessary code.
-"""
+Please implement the complete code in {language}."""
         )
         coding_messages = messages + [coding_instruction]
-        
-        logger.info("CODING: Invoking coding LLM")
+        coding_agent = get_language_coding_agent(language)
         response = coding_agent.invoke({"messages": coding_messages})
-        logger.info("CODING: Received response from LLM")
         
         # Add the response to the messages
         messages.append(response)
-        
-        # Extract the code from the response
-        content = response.content
-        logger.info("CODING: Extracting code from response")
-        
-        # Check if there are multiple files in the response
-        file_pattern = r"(?:FILENAME|filename):\s*([^\n]+)"
-        filenames = re.findall(file_pattern, content)
-        
-        if filenames:
-            logger.info(f"CODING: Detected multiple files: {filenames}")
-            
-            # Extract code for each file
-            files_dict = {}
-            
-            # Pattern to match file blocks
-            # This looks for FILENAME: filename followed by code until the next FILENAME or end of content
-            file_blocks_pattern = r"(?:FILENAME|filename):\s*([^\n]+)(?:\n|\r\n?)(.*?)(?=(?:\n|\r\n?)(?:FILENAME|filename):|$)"
-            file_blocks = re.findall(file_blocks_pattern, content, re.DOTALL)
-            
-            for filename, file_code in file_blocks:
-                # Clean up the filename and code
-                clean_filename = filename.strip()
-                
-                # Remove any markdown code block markers
-                clean_code = re.sub(r'^```\w*\n|```$', '', file_code, flags=re.MULTILINE).strip()
-                
-                # Store in dictionary
-                files_dict[clean_filename] = clean_code
-                logger.info(f"CODING: Extracted code for {clean_filename} ({len(clean_code)} characters)")
-            
-            # Save all files
-            if files_dict:
-                save_result = save_multiple_files(files_dict)
-                logger.info(f"CODING: Multiple files saved: {save_result}")
-                
-                # For the state, concatenate all code with file headers
-                all_code = ""
-                for filename, file_code in files_dict.items():
-                    all_code += f"# FILENAME: {filename}\n\n{file_code}\n\n"
-                
-                code = all_code
-            else:
-                # Fallback to regular code extraction if file parsing failed
-                code = extract_code_from_response(content)
-                logger.info(f"CODING: Extracted single code block ({len(code)} characters)")
-        else:
-            # Regular code extraction for single file
-            code = extract_code_from_response(content)
-            logger.info(f"CODING: Extracted single code block ({len(code)} characters)")
         
         elapsed = time.time() - start_time
         logger.info(f"CODING: Completed in {elapsed:.2f} seconds")
@@ -585,6 +649,7 @@ Make sure each file is properly formatted and includes all necessary code.
         return {"messages": messages, "task": state.get("task", ""), 
                 "plan": plan, "code": code, 
                 "review": state.get("review", ""), "test_results": state.get("test_results", ""),
+                "language": language,  # Store the selected language in the state
                 "iteration_count": state.get("iteration_count", 0),
                 "next": "orchestrator"}
     except GoogleAPIError as api_err:
@@ -594,6 +659,7 @@ Make sure each file is properly formatted and includes all necessary code.
         return {"messages": messages, "task": state.get("task", ""), 
                 "plan": plan, "code": state.get("code", ""), 
                 "review": state.get("review", ""), "test_results": state.get("test_results", ""),
+                "language": language,
                 "iteration_count": state.get("iteration_count", 0),
                 "next": "orchestrator"}
     except Exception as e:
@@ -603,6 +669,7 @@ Make sure each file is properly formatted and includes all necessary code.
         return {"messages": messages, "task": state.get("task", ""), 
                 "plan": plan, "code": state.get("code", ""), 
                 "review": state.get("review", ""), "test_results": state.get("test_results", ""),
+                "language": language,
                 "iteration_count": state.get("iteration_count", 0),
                 "next": "orchestrator"}
 
@@ -614,10 +681,13 @@ def checking(state: AgentState) -> AgentState:
     messages = state["messages"]
     plan = state["plan"]
     code = state["code"]
+    language = state.get("language", "")
     
     try:
         # Add a specific instruction for the checking agent
-        checking_instruction = HumanMessage(content=f"Review this code:\n\n{code}\n\nBased on the plan:\n\n{plan}")
+        checking_instruction = HumanMessage(
+            content=f"Review this {language} code:\n\n{code}\n\nBased on the plan:\n\n{plan}\n\nFocus on {language}-specific best practices and standards."
+        )
         checking_messages = messages + [checking_instruction]
         
         logger.info("CHECKING: Invoking checking LLM")
@@ -638,6 +708,7 @@ def checking(state: AgentState) -> AgentState:
         return {"messages": messages, "task": state.get("task", ""), 
                 "plan": plan, "code": code, 
                 "review": review, "test_results": state.get("test_results", ""),
+                "language": language,
                 "iteration_count": state.get("iteration_count", 0),
                 "next": "orchestrator"}
     except GoogleAPIError as api_err:
@@ -647,6 +718,7 @@ def checking(state: AgentState) -> AgentState:
         return {"messages": messages, "task": state.get("task", ""), 
                 "plan": plan, "code": code, 
                 "review": state.get("review", ""), "test_results": state.get("test_results", ""),
+                "language": language,
                 "iteration_count": state.get("iteration_count", 0),
                 "next": "orchestrator"}
     except Exception as e:
@@ -656,6 +728,7 @@ def checking(state: AgentState) -> AgentState:
         return {"messages": messages, "task": state.get("task", ""), 
                 "plan": plan, "code": code, 
                 "review": state.get("review", ""), "test_results": state.get("test_results", ""),
+                "language": language,
                 "iteration_count": state.get("iteration_count", 0),
                 "next": "orchestrator"}
 
@@ -667,6 +740,7 @@ def testing(state: AgentState) -> AgentState:
     messages = state["messages"]
     plan = state["plan"]
     code = state["code"]
+    language = state.get("language", "")
     
     try:
         # First, run the code to get test results
@@ -675,6 +749,9 @@ def testing(state: AgentState) -> AgentState:
         # Check if we have multiple files
         file_pattern = r"# FILENAME: ([^\n]+)"
         filenames = re.findall(file_pattern, code)
+        
+        # Get appropriate file extension based on language
+        file_extension = get_file_extension(language) if language else ".py"
         
         if filenames:
             logger.info(f"TESTING: Detected multiple files: {filenames}")
@@ -686,72 +763,100 @@ def testing(state: AgentState) -> AgentState:
             files_dict = {}
             main_file = None
             main_content = None
-            test_output = "Multiple files detected:\n"
+            test_output = f"Multiple files detected for {language} project:\n"
             
             for filename, file_code in file_blocks:
                 files_dict[filename] = file_code
                 test_output += f"- {filename} ({len(file_code)} characters)\n"
                 
-                # Save each file
-                with open(filename, 'w') as f:
-                    f.write(file_code)
+                # Sanitize the filename
+                sanitized_filename = sanitize_filename(filename)
                 
-                # Determine the main file to run (if it's Python)
-                if filename.endswith('.py') and (main_file is None or 'main' in filename.lower()):
-                    main_file = filename
+                # Save each file
+                try:
+                    # Ensure the file can be written
+                    if ensure_file_writable(sanitized_filename):
+                        # Open with 'w+' mode to create or truncate the file
+                        with open(sanitized_filename, 'w+') as f:
+                            f.write(file_code)
+                        
+                        # Log if filename was changed
+                        if sanitized_filename != filename:
+                            logger.info(f"TESTING: Sanitized filename from '{filename}' to '{sanitized_filename}'")
+                    else:
+                        logger.warning(f"TESTING: Could not ensure write access to {sanitized_filename}")
+                        test_output += f"Warning: Could not ensure write access to {sanitized_filename}\n"
+                except OSError as e:
+                    logger.error(f"TESTING: Error saving file {filename}: {str(e)}")
+                    test_output += f"Error saving {filename}: {str(e)}\n"
+                    continue
+                
+                # Determine the main file to run based on language
+                if language == "Python" and sanitized_filename.endswith('.py') and (main_file is None or 'main' in sanitized_filename.lower()):
+                    main_file = sanitized_filename
                     main_content = file_code
-                elif filename.endswith('.html'):
-                    main_file = filename
+                elif language == "JavaScript" and sanitized_filename.endswith('.js') and (main_file is None or 'main' in sanitized_filename.lower() or 'index' in sanitized_filename.lower()):
+                    main_file = sanitized_filename
+                    main_content = file_code
+                elif language == "C++" and sanitized_filename.endswith('.cpp') and (main_file is None or 'main' in sanitized_filename.lower()):
+                    main_file = sanitized_filename
+                    main_content = file_code
+                elif language == "HTML/CSS" and sanitized_filename.endswith('.html'):
+                    main_file = sanitized_filename
                     main_content = file_code
             
-            # Run the main Python file if found
-            if main_file and main_file.endswith('.py'):
-                run_result = run_code(main_content, main_file)
-                test_output += f"\nExecution results for {main_file}:\n{run_result}"
-            elif main_file and main_file.endswith('.html'):
-                test_output += f"\nHTML file saved as {main_file}. To test: Open in a web browser."
+            # Run the main file based on language
+            if main_file:
+                if language == "Python" and main_file.endswith('.py'):
+                    run_result = run_code(main_content, main_file)
+                    test_output += f"\nExecution results for Python file {main_file}:\n{run_result}"
+                elif language == "JavaScript" and main_file.endswith('.js'):
+                    test_output += f"\nJavaScript file saved as {main_file}. To test: Run with Node.js or include in an HTML file."
+                elif language == "C++" and main_file.endswith('.cpp'):
+                    test_output += f"\nC++ file saved as {main_file}. To test: Compile with g++ and run the executable."
+                elif language == "HTML/CSS" or main_file.endswith('.html'):
+                    test_output += f"\nHTML file saved as {main_file}. To test: Open in a web browser."
+                else:
+                    test_output += f"\nFile saved as {main_file}. Manual testing required for this file type."
             else:
-                test_output += "\nNo runnable Python file identified. Manual testing required."
+                test_output += f"\nNo runnable main file identified for {language}. Manual testing required."
         else:
-            # Generate a filename based on the task
+            # Generate a filename based on the task and language
             task_words = state.get("task", "code").split()
-            
-            # Determine file type based on content
-            file_extension = ".py"  # Default
-            if "<html" in code.lower() or "<!doctype html" in code.lower():
-                file_extension = ".html"
-            elif "function" in code and "{" in code and "}" in code and "var" in code:
-                file_extension = ".js"
-            elif "{" in code and "}" in code and (":" in code or "#" in code) and not "def " in code:
-                file_extension = ".css"
-            
             filename = "_".join([word.lower() for word in task_words[:3] if word.isalnum()]) + file_extension
             if not filename or filename == file_extension:
                 filename = "test_code" + file_extension
             
-            # Run the code and capture results
+            # Run the code and capture results based on language
             test_output = ""
-            if file_extension == ".py":
+            if language == "Python":
                 test_output = run_code(code, filename)
+            elif language == "JavaScript":
+                # Save JavaScript file but don't execute
+                with open(filename, 'w') as f:
+                    f.write(code)
+                test_output = f"JavaScript file saved as {filename}. To test: Run with Node.js or include in an HTML file."
+            elif language == "C++":
+                # Save C++ file but don't execute
+                with open(filename, 'w') as f:
+                    f.write(code)
+                test_output = f"C++ file saved as {filename}. To test: Compile with g++ and run the executable."
+            elif language == "HTML/CSS":
+                # Save HTML file but don't execute
+                with open(filename, 'w') as f:
+                    f.write(code)
+                test_output = f"HTML file saved as {filename}. To test: Open in a web browser."
             else:
-                # For non-Python files, save the file but don't execute
+                # For unknown languages, save the file but don't execute
                 with open(filename, 'w') as f:
                     f.write(code)
                 test_output = f"File saved as {filename}. For non-Python files, manual testing is required."
-                
-                # For HTML files, we can suggest opening in a browser
-                if file_extension == ".html":
-                    test_output += "\nTo test HTML: Open the file in a web browser to verify layout and functionality."
-                elif file_extension == ".js":
-                    test_output += "\nTo test JavaScript: Include in an HTML file with <script> tags or run with Node.js."
-                elif file_extension == ".css":
-                    test_output += "\nTo test CSS: Link to an HTML file with <link> tag to verify styling."
         
         logger.info(f"TESTING: Code handling complete. Output length: {len(test_output)} characters")
         
         # Add a specific instruction for the testing agent
         testing_instruction = HumanMessage(
-            content=f"""Here is the code ({file_extension[1:]} file):
+            content=f"""Here is the code ({language if language else file_extension[1:]} file):
 
 ```
 {code}
@@ -768,11 +873,12 @@ Based on the plan:
 {plan}
 
 Please analyze the code and test results. Identify any bugs, errors, or issues.
-For {file_extension[1:]} code, focus on appropriate best practices and standards.
+For {language if language else file_extension[1:]} code, focus on appropriate best practices and standards.
 Provide specific recommendations for fixing any problems you find.
 If the code appears correct, verify that it meets all requirements from the plan.
 """
         )
+        
         testing_messages = messages + [testing_instruction]
         
         logger.info("TESTING: Invoking testing LLM")
@@ -803,6 +909,7 @@ If the code appears correct, verify that it meets all requirements from the plan
                 "plan": plan, "code": code, 
                 "review": state.get("review", ""), 
                 "test_results": test_results, 
+                "language": language,
                 "iteration_count": state.get("iteration_count", 0),
                 "next": next_step}
     except GoogleAPIError as api_err:
@@ -813,6 +920,7 @@ If the code appears correct, verify that it meets all requirements from the plan
                 "plan": plan, "code": code, 
                 "review": state.get("review", ""), 
                 "test_results": f"Error during testing: {str(api_err)}", 
+                "language": language,
                 "iteration_count": state.get("iteration_count", 0),
                 "next": "orchestrator"}
     except Exception as e:
@@ -823,6 +931,7 @@ If the code appears correct, verify that it meets all requirements from the plan
                 "plan": plan, "code": code, 
                 "review": state.get("review", ""), 
                 "test_results": f"Error during testing: {str(e)}", 
+                "language": language,
                 "iteration_count": state.get("iteration_count", 0),
                 "next": "orchestrator"}
 
@@ -901,6 +1010,7 @@ if __name__ == "__main__":
         "code": "",
         "review": "",
         "test_results": "",
+        "language": "",
         "iteration_count": 0,  # Initialize iteration counter
         "next": "orchestrator"
     }
@@ -960,10 +1070,16 @@ if __name__ == "__main__":
                 file_blocks = re.findall(file_blocks_pattern, final_state["code"], re.DOTALL)
                 
                 for filename, file_code in file_blocks:
-                    with open(filename, 'w') as f:
-                        f.write(file_code)
-                    logger.info(f"MAIN: Code saved to {filename}")
-                    print(f"\nCode saved to {filename}")
+                    sanitized_filename = sanitize_filename(filename)
+                    # Ensure the file can be written
+                    if ensure_file_writable(sanitized_filename):
+                        with open(sanitized_filename, 'w+') as f:
+                            f.write(file_code)
+                        logger.info(f"MAIN: Code saved to {sanitized_filename}")
+                        print(f"\nCode saved to {sanitized_filename}")
+                    else:
+                        logger.warning(f"MAIN: Could not ensure write access to {sanitized_filename}")
+                        print(f"\nWarning: Could not ensure write access to {sanitized_filename}")
                 
                 print(f"\nMultiple files created. Check each file for specific instructions.")
             else:
